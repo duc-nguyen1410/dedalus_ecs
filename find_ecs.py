@@ -307,22 +307,27 @@ te_eq = dist.Field(name='te_eq', bases=(x_basis,z_basis))
 
 # build linearized equations
 # Linearized LBVP (Jacobian · δx = -Residual)
-problem_L = de.LBVP([p, tau_p, u, te, sa], namespace= globals())
+problem_L = de.LBVP([p, tau_p, u, te, sa, tau_u, tau_te, tau_sa], namespace= globals())
 problem_L.add_equation("trace(grad(u)) + tau_p = 0")
 problem_L.add_equation("integ(p) = 0") # Pressure gauge
-problem_L.add_equation("grad(p) - p1*lap_u - p2*(p3*te-p4*sa)*ez + u@grad(u_eq)+u_eq@grad(u)= - u_rhs")
-problem_L.add_equation("- p5*lap_te + w + u@grad(te_eq)+u_eq@grad(te) = - te_rhs")
-problem_L.add_equation("- p6*lap_sa + w + u@grad(sa_eq)+u_eq@grad(sa) = - sa_rhs")
-
+problem_L.add_equation("grad(p) - p1*lap_u - p2*(p3*te-p4*sa)*ez + u@grad(u_eq)+u_eq@grad(u) + tau_u = - u_rhs")
+problem_L.add_equation("- p5*lap_te + w + u@grad(te_eq)+u_eq@grad(te) + tau_te = - te_rhs")
+problem_L.add_equation("- p6*lap_sa + w + u@grad(sa_eq)+u_eq@grad(sa) + tau_sa = - sa_rhs")
+problem_L.add_equation("integ(u) = 0")
+problem_L.add_equation("integ(te) = 0")
+problem_L.add_equation("integ(sa) = 0")
 
 # build nonlinear equations
 # Nonlinear LBVP (Full residual F(x) = 0)
-problem_NL = de.LBVP([p, tau_p, u, te, sa], namespace= globals())
+problem_NL = de.LBVP([p, tau_p, u, te, sa, tau_u, tau_te, tau_sa], namespace= globals())
 problem_NL.add_equation("trace(grad(u)) + tau_p = 0")
 problem_NL.add_equation("integ(p) = 0") # Pressure gauge
-problem_NL.add_equation("grad(p) -p1*lap_u - p2*(p3*te-p4*sa)*ez = 0")
-problem_NL.add_equation("- p5*lap_te + w = 0")
-problem_NL.add_equation("- p6*lap_sa + w = 0")
+problem_NL.add_equation("grad(p) -p1*lap_u - p2*(p3*te-p4*sa)*ez + tau_u = 0")
+problem_NL.add_equation("- p5*lap_te + w + tau_te = 0")
+problem_NL.add_equation("- p6*lap_sa + w + tau_sa = 0")
+problem_NL.add_equation("integ(u) = 0")
+problem_NL.add_equation("integ(te) = 0")
+problem_NL.add_equation("integ(sa) = 0")
 
 #----------------------------------------------------------------------------------------- #
 #----------------------------------------------------------------------------------------- #
@@ -369,7 +374,10 @@ Nunk = MY + Tsearch + Rxsearch + Rzsearch # of unknowns in x = [u,w,t,s] + const
 
 # PHASE_CONDITION = False # enable phase condition
 if PHASE_CONDITION:
-    Nunk += 2  # add one more unknown for phase condition
+    if CONTINUATION:
+        Nunk += 3 # Continuous parameter + alpha_x + alpha_z
+    else:
+        Nunk += 2  # add alpha_x + alpha_z unknown for phase condition
 
 # print('total Nunk = ',Nunk)
 f = np.zeros(Nunk)
@@ -379,14 +387,14 @@ s_begin = t_end
 s_end = s_begin + NX*NZ
 u_begin = s_end
 u_end = u_begin + NX*NZ
-v_begin = u_end
-v_end = v_begin + NX*NZ
+w_begin = u_end
+w_end = w_begin + NX*NZ
 
 
 f[t_begin:t_end] = t_data_init.ravel()
 f[s_begin:s_end] = s_data_init.ravel()
 f[u_begin:u_end] = U_data_init.ravel()
-f[v_begin:v_end] = W_data_init.ravel()
+f[w_begin:w_end] = W_data_init.ravel()
 if Tsearch:
     f[MY+Tsearch-1] = T_guess  # 'f[0]' gives the normalized period, i.e. the current value of 'T' divided by the initial guess, 'T_guess'
 if Rxsearch:
@@ -394,7 +402,9 @@ if Rxsearch:
 if Rzsearch:
     f[MY+Tsearch+Rxsearch+Rzsearch-1] = az_guess # similarly for the shift 'az'
 if PHASE_CONDITION:
-    f[-2] = 0.0  # initial guess for phase condition unknown
+    if CONTINUATION:
+        f[-3] = Lx # debug with Lx
+    f[-2] = 0.0  # initial guess for phase constraints unknown
     f[-1] = 0.0
 
 z0 = np.zeros(Nunk)
@@ -405,29 +415,42 @@ zn = np.copy(z0)
 def load_state(array_in):
     te.load_from_global_grid_data(array_in[t_begin:t_end].reshape(NX, NZ))
     sa.load_from_global_grid_data(array_in[s_begin:s_end].reshape(NX, NZ))
-    u.load_from_global_grid_data(np.stack([array_in[u_begin:u_end].reshape(NX, NZ),array_in[v_begin:v_end].reshape(NX, NZ)]))
+    u.load_from_global_grid_data(np.stack([array_in[u_begin:u_end].reshape(NX, NZ),array_in[w_begin:w_end].reshape(NX, NZ)]))
 
 
 
 def x_derivative(array_in):
-    """Compute x-derivative of a field."""
+    """Compute x-derivative of fields."""
     load_state(array_in)
-    dxu = dx(u).evaluate().allgather_data('g').real
-    dxt = dx(te).evaluate().allgather_data('g').real
-    dxs = dx(sa).evaluate().allgather_data('g').real
+    dudx = dx(u).evaluate().allgather_data('g').real
+    dtdx = dx(te).evaluate().allgather_data('g').real
+    dsdx = dx(sa).evaluate().allgather_data('g').real
     array_out = np.zeros(MY)
-    array_out[u_begin:u_end] = dxu[0].ravel()
-    array_out[v_begin:v_end] = dxu[1].ravel()
-    array_out[t_begin:t_end] = dxt.ravel()
-    array_out[s_begin:s_end] = dxs.ravel()
+    array_out[u_begin:u_end] = dudx[0].ravel()
+    array_out[w_begin:w_end] = dudx[1].ravel()
+    array_out[t_begin:t_end] = dtdx.ravel()
+    array_out[s_begin:s_end] = dsdx.ravel()
+    return array_out
+def z_derivative(array_in):
+    """Compute z-derivative of fields."""
+    load_state(array_in)
+    dudz = dz(u).evaluate().allgather_data('g').real
+    dtdz = dz(te).evaluate().allgather_data('g').real
+    dsdz = dz(sa).evaluate().allgather_data('g').real
+    array_out = np.zeros(MY)
+    array_out[u_begin:u_end] = dudz[0].ravel()
+    array_out[w_begin:w_end] = dudz[1].ravel()
+    array_out[t_begin:t_end] = dtdz.ravel()
+    array_out[s_begin:s_end] = dsdz.ravel()
     return array_out
 
 # set these once before the Newton loop starts
-# if PHASE_CONDITION:
-    # x_ref = np.copy(f[:MY]) # reference state vector for relative tolerance criterion
-    # g_ref = x_derivative(x_ref) # reference derivative for relative tolerance criterion
-    # gg = np.dot(g_ref, g_ref)
-    # phase_scale = 1.0 / np.sqrt(gg + 1e-300)
+if PHASE_CONDITION:
+    u_ref = np.copy(f[:MY]) # reference state vector for relative tolerance criterion
+    dudx_ref = x_derivative(u_ref) # reference derivative for relative tolerance criterion
+    dudz_ref = z_derivative(u_ref)
+    dudx_ref = dudx_ref / np.linalg.norm(dudx_ref) # normalization
+    dudz_ref = dudz_ref / np.linalg.norm(dudz_ref)
 
 
 
@@ -460,14 +483,10 @@ def reflec_x(field_u, sign=1):
     field_u.load_from_global_coeff_data(field_u_coeff)
 
 
-# Shift field data by 'd' units and convert to vector format
-# def TransformG(array_in, d):
-#     data_temp_c = np.copy(array_in)
-#     d_grid = int( np.round(d / (Lx/int(NX*dealias_fac))) )
-#     data_temp_c = np.roll(data_temp_c, shift=d_grid, axis=0)
-#     return GridToVector(data_temp_c)
+
 
 def TransformGx(array_in, ax):
+    ''' Apply translation symmetry operator of a drift dx=ax*Lx '''
     load_state(array_in)
     shift_x(u, ax=ax*Lx, x_basis=x_basis)
     shift_x(te, ax=ax*Lx, x_basis=x_basis)
@@ -479,9 +498,10 @@ def TransformGx(array_in, ax):
     data_temp_c[t_begin:t_end] = tg.ravel()
     data_temp_c[s_begin:s_end] = sg.ravel()
     data_temp_c[u_begin:u_end] = ug[0].ravel()
-    data_temp_c[v_begin:v_end] = ug[1].ravel()
+    data_temp_c[w_begin:w_end] = ug[1].ravel()
     return data_temp_c
 def TransformGz(array_in, az):
+    ''' Apply translation symmetry operator of a drift dz=az*Lz '''
     load_state(array_in)
     shift_z(u, az=az*Lz, z_basis=z_basis)
     shift_z(te, az=az*Lz, z_basis=z_basis)
@@ -493,10 +513,11 @@ def TransformGz(array_in, az):
     data_temp_c[t_begin:t_end] = tg.ravel()
     data_temp_c[s_begin:s_end] = sg.ravel()
     data_temp_c[u_begin:u_end] = ug[0].ravel()
-    data_temp_c[v_begin:v_end] = ug[1].ravel()
+    data_temp_c[w_begin:w_end] = ug[1].ravel()
     return data_temp_c
 # Compute infinitesimal generator of x-translation
 def dxTransform(array_in):
+    ''' Return finite-difference approximation of du/dx ~ u(x+dx)-u(x)/dx'''
     array_temp = np.copy(array_in)
 
     shifted_array_temp = TransformGx(array_temp, d_tol_translation)
@@ -505,10 +526,11 @@ def dxTransform(array_in):
     array_out[t_begin:t_end] = (shifted_array_temp[t_begin:t_end] - array_temp[t_begin:t_end])/d_tol_translation
     array_out[s_begin:s_end] = (shifted_array_temp[s_begin:s_end] - array_temp[s_begin:s_end])/d_tol_translation
     array_out[u_begin:u_end] = (shifted_array_temp[u_begin:u_end] - array_temp[u_begin:u_end])/d_tol_translation
-    array_out[v_begin:v_end] = (shifted_array_temp[v_begin:v_end] - array_temp[v_begin:v_end])/d_tol_translation
+    array_out[w_begin:w_end] = (shifted_array_temp[w_begin:w_end] - array_temp[w_begin:w_end])/d_tol_translation
     return array_out
 # Compute infinitesimal generator of z-translation
 def dzTransform(array_in):
+    ''' Return finite-difference approximation of du/dz ~ u(z+dz)-u(z)/dz'''
     array_temp = np.copy(array_in)
 
     shifted_array_temp = TransformGz(array_temp, d_tol_translation)
@@ -517,37 +539,18 @@ def dzTransform(array_in):
     array_out[t_begin:t_end] = (shifted_array_temp[t_begin:t_end] - array_temp[t_begin:t_end])/d_tol_translation
     array_out[s_begin:s_end] = (shifted_array_temp[s_begin:s_end] - array_temp[s_begin:s_end])/d_tol_translation
     array_out[u_begin:u_end] = (shifted_array_temp[u_begin:u_end] - array_temp[u_begin:u_end])/d_tol_translation
-    array_out[v_begin:v_end] = (shifted_array_temp[v_begin:v_end] - array_temp[v_begin:v_end])/d_tol_translation
+    array_out[w_begin:w_end] = (shifted_array_temp[w_begin:w_end] - array_temp[w_begin:w_end])/d_tol_translation
     return array_out
 
 
 
-''' Function phi:
 
-    Description
-    ---------------------
-    Flow map phi(array_in, T, d)
-    ---------------------
-
-    Parameters
-    ---------------------
-    array_in :
-        variable type: Real-valued, 1d numpy data array with dimension MY = n_fields*NX*NZ
-        description: state vector x0 in coefficient format
-    T :
-        variable type: float
-        description: time interval over which to apply the flow map
-    d :
-        variable type: float
-        description: shift to apply at the end of the time integration
-    ---------------------
-'''
 def phi(array_in, T, ax, az):
     solver_phi = problem_phi.build_solver(timestepper)
     
     # copy the input data
     f = np.copy(array_in)
-    u.load_from_global_grid_data(np.stack([f[u_begin:u_end].reshape(NX, NZ),f[v_begin:v_end].reshape(NX, NZ)]))
+    u.load_from_global_grid_data(np.stack([f[u_begin:u_end].reshape(NX, NZ),f[w_begin:w_end].reshape(NX, NZ)]))
     te.load_from_global_grid_data(f[t_begin:t_end].reshape(NX, NZ))
     sa.load_from_global_grid_data(f[s_begin:s_end].reshape(NX, NZ))
 
@@ -605,7 +608,7 @@ def phi(array_in, T, ax, az):
     # save data in an array
     array_out = np.zeros(MY)
     array_out[u_begin:u_end] = ug[0].ravel()
-    array_out[v_begin:v_end] = ug[1].ravel()
+    array_out[w_begin:w_end] = ug[1].ravel()
     array_out[t_begin:t_end] = tg.ravel()
     array_out[s_begin:s_end] = sg.ravel()
     
@@ -619,7 +622,7 @@ def phi_out(array_in, T, ax, az):
     
     # copy the input data
     f = np.copy(array_in)
-    u.load_from_global_grid_data(np.stack([f[u_begin:u_end].reshape(NX, NZ),f[v_begin:v_end].reshape(NX, NZ)]))
+    u.load_from_global_grid_data(np.stack([f[u_begin:u_end].reshape(NX, NZ),f[w_begin:w_end].reshape(NX, NZ)]))
     te.load_from_global_grid_data(f[t_begin:t_end].reshape(NX, NZ))
     sa.load_from_global_grid_data(f[s_begin:s_end].reshape(NX, NZ))
 
@@ -689,32 +692,9 @@ def phi_out(array_in, T, ax, az):
             solver_phi.step(dt)
 
 
-
-
-''' Function Dphi_prod:
-
-    Description
-    ---------------------
-    Matrix-vector product, math notation: (d phi / dx_0) * delta_x 
-    ---------------------
-
-    Parameters
-    ---------------------
-    array_base :
-        variable type: Real-valued, 1d numpy data array with dimension MY = n_fields*NX*NZ
-        description: initial (base) vector x0 in coefficient format
-    array_pert :
-        variable type: Real-valued, 1d numpy data array with dimension MY = n_fields*NX*NZ
-        description: 'delta_x' in the equation for the Matrix-vector product
-    T :
-        variable type: float
-        description: time interval over which to apply the flow map
-    d :
-        variable type: float
-        description: shift to apply at the end of the time integration
-    ---------------------
-'''
 def Dphi_prod(array_base, array_pert, phi_base, T0, ax0, az0):
+    ''' Return (d phi / dx_0) * delta_x '''
+
     norm_v = np.linalg.norm(array_pert)
     if norm_v == 0:
         return np.zeros_like(array_pert)
@@ -724,33 +704,13 @@ def Dphi_prod(array_base, array_pert, phi_base, T0, ax0, az0):
     array_final = phi(array_init, T0, ax0, az0)
 
     array_out = (array_final-phi_base)/epsilon
-    
-    # IMPORTANT: remove symmetry (neutral) component
-    # g = x_derivative(array_base)
-    # array_out = project_out(array_out, g)
     return array_out
 ''' '''
 
 
 
-''' Function applyLinearOperator:
-
-    Description
-    ---------------------
-    Linearized operator for the Newton iteration
-    ---------------------
-
-    Parameters
-    ---------------------
-    array_base :
-        variable type: Real-valued, 1d numpy data array with dimension MY + 2 = n_fields*NX*NZ + 2
-        description: base vector about which the linearization is performed, including the period 'T' and shift 'd'
-    array_pert :
-        variable type: Real-valued, 1d numpy data array with dimension MY + 2 = n_fields*NX*NZ + 2
-        description: linear perturbation we are solving for, i.e.,  'dx' in the equation 'A*dx = b'
-    ---------------------
-'''
 def applyLinearOperator(array_base, array_pert, phi_base):
+    ''' Linearized operator for the Newton iteration '''
     if lbvpmode==True and ecsmode == "eqb" and Rxsearch==False and Rzsearch==False:
         # use LBVP for equilibrium
         solverL = problem_L.build_solver()
@@ -760,13 +720,13 @@ def applyLinearOperator(array_base, array_pert, phi_base):
         
         # copy the base state
         u_eq.load_from_global_grid_data(np.stack([x_base[u_begin:u_end].reshape(NX, NZ),
-                                        x_base[v_begin:v_end].reshape(NX, NZ)]))
+                                        x_base[w_begin:w_end].reshape(NX, NZ)]))
         te_eq.load_from_global_grid_data(x_base[t_begin:t_end].reshape(NX,NZ))
         sa_eq.load_from_global_grid_data(x_base[s_begin:s_end].reshape(NX,NZ))
 
         # copy the perturbation state
         u.load_from_global_grid_data(np.stack([delta_x[u_begin:u_end].reshape(NX, NZ),
-                                    delta_x[v_begin:v_end].reshape(NX, NZ)]))
+                                    delta_x[w_begin:w_end].reshape(NX, NZ)]))
         te.load_from_global_grid_data(delta_x[t_begin:t_end].reshape(NX,NZ))
         sa.load_from_global_grid_data(delta_x[s_begin:s_end].reshape(NX,NZ))
 
@@ -779,7 +739,7 @@ def applyLinearOperator(array_base, array_pert, phi_base):
 
         array_out = np.zeros(MY)
         array_out[u_begin:u_end] = u.allgather_data('g')[0].real.ravel()
-        array_out[v_begin:v_end] = u.allgather_data('g')[1].real.ravel()
+        array_out[w_begin:w_end] = u.allgather_data('g')[1].real.ravel()
         array_out[t_begin:t_end] = te.allgather_data('g').real.ravel()
         array_out[s_begin:s_end] = sa.allgather_data('g').real.ravel()
         
@@ -804,52 +764,46 @@ def applyLinearOperator(array_base, array_pert, phi_base):
         array_out = np.zeros(Nunk)
         array_out[:MY] = Dphi_prod(x_base, delta_x, phi_base, T0, ax0, az0) - delta_x 
         if Tsearch:
-            array_out[:MY] += RHS(np.copy(phi_base))*delta_T 
-            array_out[MY+Tsearch-1] = np.matmul(np.conj(RHS(x_base)), delta_x)
+            array_out[:MY] += RHS(np.copy(phi_base))*delta_T # dudt_ref * alpha_t
+            array_out[MY+Tsearch-1] = np.matmul(np.conj(RHS(x_base)), delta_x) # dot(dudt_ref, delta_t)
         if Rxsearch:
-            array_out[:MY] += dxTransform(phi_base)*delta_dx
-            array_out[MY+Tsearch+Rxsearch-1] = np.matmul(np.conj(dxTransform(x_base)), delta_x)
+            array_out[:MY] += dxTransform(phi_base)*delta_dx # dudx_ref * alpha_x
+            array_out[MY+Tsearch+Rxsearch-1] = np.matmul(np.conj(dxTransform(x_base)), delta_x) # dot(dudx_ref, delta_x) <- Phase condition
         if Rzsearch:
-            array_out[:MY] += dzTransform(phi_base)*delta_dz
-            array_out[MY+Tsearch+Rxsearch+Rzsearch-1] = np.matmul(np.conj(dzTransform(x_base)), delta_x)
+            array_out[:MY] += dzTransform(phi_base)*delta_dz # dudz_ref * alpha_z
+            array_out[MY+Tsearch+Rxsearch+Rzsearch-1] = np.matmul(np.conj(dzTransform(x_base)), delta_x) # dot(dudz_ref, delta_x) <- Phase condition
+        
         # ===== PHASE CONDITION JACOBIAN =====
-        # if PHASE_CONDITION:
-        #     delta_alpha = array_pert[-1]
-        #     array_out[:MY] += g_ref * delta_alpha # Column for alpha: ∂(Ru)/∂alpha = g_ref
-        #     array_out[-1] = phase_scale * np.dot(delta_x, g_ref) # Row for phase condition: ∂g/∂x · δx = g_ref · δx
+        if PHASE_CONDITION:
+            alpha_x = array_pert[-2]
+            alpha_z = array_pert[-1]
+
+            array_out[:MY] += dudx_ref * alpha_x + dudz_ref * alpha_z # Column for alpha: ∂(Ru)/∂alpha = g_ref
+            
+            if CONTINUATION:
+                delta_mu = array_pert[-3]
+                array_out[-3] = delta_mu
+
+            array_out[-2] = np.dot(dudx_ref, delta_x) # Constraint rows = inner(dudx, delta_x)
+            array_out[-1] = np.dot(dudz_ref, delta_x)
+
         return array_out
-''' '''
 
 
-
-''' Function RHS:
-
-    Description
-    ---------------------
-    Calculate time-derivative in the final state via finite difference (equal to the r.h.s. of the equations of motion)
-    ---------------------
-
-    Parameters
-    ---------------------
-    array_in :
-        variable type: Real-valued, 1d numpy data array with dimension MY = n_fields*NX*NZ
-        description: input vector
-    ---------------------
-'''
 def RHS(array_in):
-    
+    ''' Calculate time-derivative in the final state via finite difference (equal to the r.h.s. of the equations of motion) '''
     solver_phi = problem_phi.build_solver(de.RK222)
     
     # copy the input data
     f = np.copy(array_in)
-    u.load_from_global_grid_data(np.stack([f[u_begin:u_end].reshape(NX, NZ),f[v_begin:v_end].reshape(NX, NZ)]))
+    u.load_from_global_grid_data(np.stack([f[u_begin:u_end].reshape(NX, NZ),f[w_begin:w_end].reshape(NX, NZ)]))
     te.load_from_global_grid_data(f[t_begin:t_end].reshape(NX, NZ))
     sa.load_from_global_grid_data(f[s_begin:s_end].reshape(NX, NZ))
 
     t_data_initial = te.allgather_data('g').real
     s_data_initial = sa.allgather_data('g').real
-    U_data_initial = u.allgather_data('g')[0].real
-    V_data_initial = u.allgather_data('g')[1].real
+    u_data_initial = u.allgather_data('g')[0].real
+    w_data_initial = u.allgather_data('g')[1].real
 
     for i in range(n_timesteps):
         solver_phi.step(delta)
@@ -859,139 +813,75 @@ def RHS(array_in):
     ug = u.allgather_data('g').real
 
     array_out = np.zeros(MY)
-    array_out[u_begin:u_end] = GridToVector((np.copy(ug[0]) - U_data_initial)/(n_timesteps*delta))
-    array_out[v_begin:v_end] = GridToVector((np.copy(ug[1]) - V_data_initial)/(n_timesteps*delta))
+    array_out[u_begin:u_end] = GridToVector((np.copy(ug[0]) - u_data_initial)/(n_timesteps*delta))
+    array_out[w_begin:w_end] = GridToVector((np.copy(ug[1]) - w_data_initial)/(n_timesteps*delta))
     array_out[t_begin:t_end] = GridToVector((np.copy(tg) - t_data_initial)/(n_timesteps*delta))
     array_out[s_begin:s_end] = GridToVector((np.copy(sg) - s_data_initial)/(n_timesteps*delta))
     return array_out
-''' '''
 
-
-
-
-''' Function applyNonLinearOperator:
-
-    Description
-    ---------------------
-    Full nonlinear operator
-    ---------------------
-
-    Parameters
-    ---------------------
-    array_in :
-        variable type: Real-valued, 1d numpy data array with dimension MY + 2 = n_fields*NX*NZ + 2
-        description: input vector
-    ---------------------
-'''
 def applyNonLinearOperator(array_in):
-    # if ecsmode=="eqb" and Rxsearch==False and Rzsearch==False:
-    #     # use LBVP for equilibrium
-    #     solverNL = problem_NL.build_solver()
+    ''' Full nonlinear operator '''
+    if lbvpmode==True and ecsmode=="eqb" and Rxsearch==False and Rzsearch==False:
+        # use LBVP for equilibrium
+        solverNL = problem_NL.build_solver()
 
-    #     f = np.copy(array_in)
+        f = np.copy(array_in)
         
-    #     # copy the perturbation state
-    #     u.load_from_global_grid_data(
-    #         np.stack([f[u_begin:u_end].reshape(NX, NZ),
-    #                 f[v_begin:v_end].reshape(NX, NZ)])
-    #     )
-    #     te.load_from_global_grid_data(f[t_begin:t_end].reshape(NX,NZ))
-    #     sa.load_from_global_grid_data(f[s_begin:s_end].reshape(NX,NZ))
+        # copy the perturbation state
+        u.load_from_global_grid_data(
+            np.stack([f[u_begin:u_end].reshape(NX, NZ),
+                    f[w_begin:w_end].reshape(NX, NZ)])
+        )
+        te.load_from_global_grid_data(f[t_begin:t_end].reshape(NX,NZ))
+        sa.load_from_global_grid_data(f[s_begin:s_end].reshape(NX,NZ))
 
-    #     solverNL.solve()
+        solverNL.solve()
 
-    #     # gather data
-    #     array_out = np.zeros(MY)
-    #     array_out[u_begin:u_end] = u.allgather_data('g')[0].real.ravel()
-    #     array_out[v_begin:v_end] = u.allgather_data('g')[1].real.ravel()
-    #     array_out[t_begin:t_end] = te.allgather_data('g').real.ravel()
-    #     array_out[s_begin:s_end] = sa.allgather_data('g').real.ravel()
+        # gather data
+        array_out = np.zeros(MY)
+        array_out[u_begin:u_end] = u.allgather_data('g')[0].real.ravel()
+        array_out[w_begin:w_end] = u.allgather_data('g')[1].real.ravel()
+        array_out[t_begin:t_end] = te.allgather_data('g').real.ravel()
+        array_out[s_begin:s_end] = sa.allgather_data('g').real.ravel()
 
-    #     return array_out
-    # else:
-    array_out = np.zeros(Nunk)
-    if Tsearch:
-        T_temp = array_in[MY+Tsearch-1]
+        return array_out
     else:
-        T_temp = T_guess
+        array_out = np.zeros(Nunk)
+        if Tsearch:
+            T_temp = array_in[MY+Tsearch-1]
+        else:
+            T_temp = T_guess
 
-    if Rxsearch:
-        ax_temp = array_in[MY+Tsearch+Rxsearch-1]
-    else:
-        ax_temp = ax_guess
+        if Rxsearch:
+            ax_temp = array_in[MY+Tsearch+Rxsearch-1]
+        else:
+            ax_temp = ax_guess
 
-    if Rzsearch:
-        az_temp = array_in[MY+Tsearch+Rxsearch+Rzsearch-1]
-    else:
-        az_temp = az_guess
+        if Rzsearch:
+            az_temp = array_in[MY+Tsearch+Rxsearch+Rzsearch-1]
+        else:
+            az_temp = az_guess
 
-    array_out[:MY] = -phi(array_in[:MY], T_temp, ax_temp, az_temp) + array_in[:MY]
+        array_out[:MY] = -phi(array_in[:MY], T_temp, ax_temp, az_temp) + array_in[:MY]
 
-    # ===== PHASE CONDITION =====
-    # if PHASE_CONDITION:
-    #     x = array_in[:MY]
-    #     alpha = array_in[-1]
-    #     array_out[:MY] += alpha * g_ref
-    #     array_out[-1] = phase_scale * np.dot(x - x_ref, g_ref)
+        # ===== PHASE CONDITION =====
+        if PHASE_CONDITION:
+            u_base = array_in[:MY]
+            if CONTINUATION:
+                array_out[-3] = array_in[-3] # fix continuous parameter
+            array_out[-2] = np.dot(u_base - u_ref, dudx_ref)
+            array_out[-1] = np.dot(u_base - u_ref, dudz_ref)
+        return array_out
 
-    return array_out
-''' '''
-# def arnoldi_iteration(x_base, phi_base, T, d, r, n):
-#     Q = np.zeros((r.size, n+1), dtype=complex)
-#     H = np.zeros((n+1, n), dtype=complex)
 
-#     Q[:, 0] = r / np.linalg.norm(r)
 
-#     for k in range(1, n+1):
-
-#         # Krylov vector
-#         Q[:, k] = Dphi_prod(x_base, Q[:, k-1], phi_base, T, d)
-
-#         # Modified Gram–Schmidt
-#         for j in range(k):
-#             H[j, k-1] = np.vdot(Q[:, j], Q[:, k])
-#             Q[:, k] -= H[j, k-1] * Q[:, j]
-
-#         # Reorthogonalize (important!)
-#         for j in range(k):
-#             h2 = np.vdot(Q[:, j], Q[:, k])
-#             H[j, k-1] += h2
-#             Q[:, k] -= h2 * Q[:, j]
-
-#         # Normalize
-#         H[k, k-1] = np.linalg.norm(Q[:, k])
-#         if H[k, k-1] < 1e-14:
-#             print("Arnoldi breakdown at k =", k)
-#             return Q[:, :k], H[:k+1, :k]
-
-#         Q[:, k] /= H[k, k-1]
-
-#     return Q, H
-
-def project_out(v, g):
-    """Remove component of v along g: v <- v - g*(g·v)/(g·g)."""
-    gg = np.dot(g, g)
-    if gg == 0:
-        return v
-    return v - g * (np.dot(g, v) / gg)
 def arnoldi_iteration(x_base, phi_base, T, ax, az, r, n:int):
-    # g = x_derivative(x_base)          # group tangent (neutral direction)
-    # r = project_out(r, g)             # ensure start vector not aligned with neutral dir
-
     Q = np.zeros((r.size, n+1))
     H = np.zeros((n+1, n))
     Q[:,0] = r/np.linalg.norm(r)
 
     for k in range(1, n + 1):
-    #     Q[:,k] = Dphi_prod(x_base, Q[:, k - 1], phi_base, T, d)
-    #     for j in range(0, k):
-    #         H[j, k-1] = np.matmul(np.conj(Q[:,j]), Q[:,k])
-    #         Q[:,k] = Q[:,k] - H[j, k-1]*Q[:,j]
-    #     H[k, k-1] = np.linalg.norm(Q[:,k])
-    #     Q[:,k] = Q[:,k]/H[k, k-1]
-
         v = Dphi_prod(x_base, Q[:, k - 1], phi_base, T, ax, az)
-        # v = project_out(v, g)         # <- key: remove neutral component here
         for j in range(0, k):
             H[j, k-1] = np.vdot(Q[:,j], v)
             v = v - H[j, k-1]*Q[:,j]
@@ -1177,7 +1067,7 @@ def save_flow_properties(f):
     # copy the input data
     u.load_from_global_grid_data(
         np.stack([f[u_begin:u_end].reshape(NX, NZ),
-                f[v_begin:v_end].reshape(NX, NZ)])
+                f[w_begin:w_end].reshape(NX, NZ)])
     )
     te.load_from_global_grid_data(f[t_begin:t_end].reshape(NX, NZ))
     sa.load_from_global_grid_data(f[s_begin:s_end].reshape(NX, NZ))
@@ -1228,7 +1118,7 @@ def save_flow_properties(f):
 #---------------------------------------- #
 def save_solution(f, final_error=0, name = 'solution'):
     # copy the input data
-    u.load_from_global_grid_data(np.stack([f[u_begin:u_end].reshape(NX, NZ),f[v_begin:v_end].reshape(NX, NZ)]))
+    u.load_from_global_grid_data(np.stack([f[u_begin:u_end].reshape(NX, NZ),f[w_begin:w_end].reshape(NX, NZ)]))
     te.load_from_global_grid_data(f[t_begin:t_end].reshape(NX, NZ))
     sa.load_from_global_grid_data(f[s_begin:s_end].reshape(NX, NZ))
     T_grid_data_out = te.allgather_data('g').real
@@ -1434,7 +1324,7 @@ def findsoln(f0):
 
     
 
-    # print(np.shape(f[(v_begin):(v_end)]))
+    # print(np.shape(f[(w_begin):(w_end)]))
     error = 0
     b = applyNonLinearOperator(f)
     normb = np.linalg.norm(b)
@@ -1469,6 +1359,13 @@ def findsoln(f0):
                 log_file.writelines("\n")
         phi_base = []
 
+        # TODO: PLEASE DO NOT UPDATE REFERENCE STATE OF PHASE CONDITION HERE IN CONTINUATION
+        if PHASE_CONDITION and not CONTINUATION:
+            u_ref = np.copy(f[:MY]) # reference state vector for relative tolerance criterion
+            dudx_ref = x_derivative(u_ref) # reference derivative for relative tolerance criterion
+            dudz_ref = z_derivative(u_ref)
+            dudx_ref = dudx_ref / np.linalg.norm(dudx_ref) # normalization
+            dudz_ref = dudz_ref / np.linalg.norm(dudz_ref)
         
         T_temp = T_guess
         ax_temp = ax_guess
@@ -1581,6 +1478,7 @@ def findsoln(f0):
     if ECS_eigen:
         if final_error < tolerance:
             if MPI.COMM_WORLD.rank == 0:
+                print('Solving linear stability problem around converged solution ...')
                 if not os.path.exists(ecs_dir+'stability/'):
                     os.mkdir(ecs_dir+'stability/')
             # compute Floquet multipliers
@@ -1653,6 +1551,7 @@ def findsoln(f0):
                 outputFile = open(ecs_dir+'stability/N_unstable.txt', 'w')
                 outputFile.writelines(str(counter))
                 outputFile.close()
+                
 
 
 
