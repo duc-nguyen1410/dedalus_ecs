@@ -1,7 +1,8 @@
 """
 
 To run the code using e.g. 16 processes:
-    $ mpiexec -n 16 python3 find_ecs_v2.11_constraint.py --ecs=eqb --odir=debug_2.9/ --kx=14 --Lz=1 --T=1 --trust=1 --eigen=true --input=debug_eigen/solution.h5
+    $ mpiexec -n 16 python3 find_ecs.py --ecs=eqb --xrel --ax=0.5 --zrel --az=0.25 --odir=eq_tw_output_dir/ --Lx=1 --Lz=1 --T=1 --dt=0.0001 --adjust_dt --trust=1 --eigen --input=guess.h5
+    $ mpiexec -n 16 python3 find_ecs.py --ecs=orb --xrel --ax=0.5 --zrel --az=0.25 --odir=po_rpo_output_dir/ --Lx=1 --Lz=1 --T=1 --dt=0.0001 --trust=1 --eigen --input=guess.h5
 
 """
 
@@ -114,6 +115,7 @@ if Rxsearch or Rzsearch:
     symmetry = False
 
 PHASE_CONDITION = args.pCond
+CONTINUATION = False
 if MPI.COMM_WORLD.rank == 0:
     print("Phase condition:", PHASE_CONDITION)
 
@@ -445,12 +447,12 @@ def z_derivative(array_in):
     return array_out
 
 # set these once before the Newton loop starts
-if PHASE_CONDITION:
-    u_ref = np.copy(f[:MY]) # reference state vector for relative tolerance criterion
-    dudx_ref = x_derivative(u_ref) # reference derivative for relative tolerance criterion
-    dudz_ref = z_derivative(u_ref)
-    dudx_ref = dudx_ref / np.linalg.norm(dudx_ref) # normalization
-    dudz_ref = dudz_ref / np.linalg.norm(dudz_ref)
+# if PHASE_CONDITION:
+u_ref = np.copy(f[:MY]) # reference state vector
+dudx_ref = x_derivative(u_ref) # spatial derivative
+dudz_ref = z_derivative(u_ref)
+dudx_ref = dudx_ref / np.linalg.norm(dudx_ref) # normalization
+dudz_ref = dudz_ref / np.linalg.norm(dudz_ref)
 
 
 
@@ -517,6 +519,7 @@ def TransformGz(array_in, az):
     return data_temp_c
 # Compute infinitesimal generator of x-translation
 def dxTransform(array_in):
+    # similar to function x_derivative
     ''' Return finite-difference approximation of du/dx ~ u(x+dx)-u(x)/dx'''
     array_temp = np.copy(array_in)
 
@@ -530,6 +533,7 @@ def dxTransform(array_in):
     return array_out
 # Compute infinitesimal generator of z-translation
 def dzTransform(array_in):
+    # similar to function z_derivative
     ''' Return finite-difference approximation of du/dz ~ u(z+dz)-u(z)/dz'''
     array_temp = np.copy(array_in)
 
@@ -546,6 +550,7 @@ def dzTransform(array_in):
 
 
 def phi(array_in, T, ax, az):
+    ''' Return F^T(x0) : state vector at final step of time-T forward integration '''
     solver_phi = problem_phi.build_solver(timestepper)
     
     # copy the input data
@@ -590,6 +595,7 @@ def phi(array_in, T, ax, az):
             shift_z(u, az=symm[6]*Lz, z_basis=z_basis)
             shift_z(te, az=symm[6]*Lz, z_basis=z_basis)
             shift_z(sa, az=symm[6]*Lz, z_basis=z_basis)
+
     if Rxsearch:
         shift_x(u, ax=ax*Lx, x_basis=x_basis)
         shift_x(te, ax=ax*Lx, x_basis=x_basis)
@@ -618,6 +624,7 @@ def phi(array_in, T, ax, az):
 
 # Output data over a single period of the ECS
 def phi_out(array_in, T, ax, az):
+    ''' Run F^T(x0) to save time-dependent data of ECS '''
     solver_phi = problem_phi.build_solver(timestepper)
     
     # copy the input data
@@ -693,7 +700,7 @@ def phi_out(array_in, T, ax, az):
 
 
 def Dphi_prod(array_base, array_pert, phi_base, T0, ax0, az0):
-    ''' Return (d phi / dx_0) * delta_x '''
+    ''' Return (F^T(x0+dx) - F^T(x0)) / ||dx|| '''
 
     norm_v = np.linalg.norm(array_pert)
     if norm_v == 0:
@@ -710,7 +717,9 @@ def Dphi_prod(array_base, array_pert, phi_base, T0, ax0, az0):
 
 
 def applyLinearOperator(array_base, array_pert, phi_base):
-    ''' Linearized operator for the Newton iteration '''
+    ''' Linearized operator for the Newton iteration 
+        (F^T(x0+dx) - F^T(x0)) / ||dx|| - dx
+    '''
     if lbvpmode==True and ecsmode == "eqb" and Rxsearch==False and Rzsearch==False:
         # use LBVP for equilibrium
         solverL = problem_L.build_solver()
@@ -763,6 +772,7 @@ def applyLinearOperator(array_base, array_pert, phi_base):
         
         array_out = np.zeros(Nunk)
         array_out[:MY] = Dphi_prod(x_base, delta_x, phi_base, T0, ax0, az0) - delta_x 
+
         if Tsearch:
             array_out[:MY] += RHS(np.copy(phi_base))*delta_T # dudt_ref * alpha_t
             array_out[MY+Tsearch-1] = np.matmul(np.conj(RHS(x_base)), delta_x) # dot(dudt_ref, delta_t)
@@ -874,15 +884,45 @@ def applyNonLinearOperator(array_in):
         return array_out
 
 
+def project_out(v):
+    ''' Project the component dudz 
+        g = du/dx or du/dz or du/dt
+    '''
+    # v <- v - g*(g·v)/(g·g)
+    # Hermitian inner products
+    if ecsmode == 'eqb':
+        gg1 = np.vdot(dudx_ref, dudx_ref)
+        gg2 = np.vdot(dudz_ref, dudz_ref)
+        g1v = np.vdot(dudx_ref, v)
+        g2v = np.vdot(dudz_ref, v)
+        return v - dudx_ref * (g1v / gg1) - dudz_ref * (g2v / gg2)
+    if ecsmode == 'orb':
+        dudt_ref = RHS(u_ref) # time-derivative
+        dudt_ref = dudt_ref / np.linalg.norm(dudt_ref) # normalization
+        gg = np.vdot(dudt_ref, dudt_ref) # <dudt_ref, dudt_ref>
+        gv = np.vdot(dudt_ref, v) # <dudt_ref, v>
+        return v - dudt_ref * (gv / gg)
+    
+
+
 
 def arnoldi_iteration(x_base, phi_base, T, ax, az, r, n:int):
+    ''' Arnoldi iteration '''
+
+    # Ensure starting vector is orthogonal to neutral direction gz=du/dz
+    r = project_out(r)
+
     Q = np.zeros((r.size, n+1))
     H = np.zeros((n+1, n))
     Q[:,0] = r/np.linalg.norm(r)
 
     for k in range(1, n + 1):
-        v = Dphi_prod(x_base, Q[:, k - 1], phi_base, T, ax, az)
-        for j in range(0, k):
+        q_in = project_out(Q[:, k-1]) # Project input before applying L
+        v = Dphi_prod(x_base, q_in, phi_base, T, ax, az) # Apply operator
+        v = project_out(v) # Project output
+
+        # v = Dphi_prod(x_base, Q[:, k - 1], phi_base, T, ax, az)
+        for j in range(0, k): # Arnoldi orthogonalization
             H[j, k-1] = np.vdot(Q[:,j], v)
             v = v - H[j, k-1]*Q[:,j]
         H[k, k-1] = np.linalg.norm(v)
@@ -1478,7 +1518,7 @@ def findsoln(f0):
     if ECS_eigen:
         if final_error < tolerance:
             if MPI.COMM_WORLD.rank == 0:
-                print('Solving linear stability problem around converged solution ...')
+                print('Solving linear stability problem around converged solution ...', flush=True)
                 if not os.path.exists(ecs_dir+'stability/'):
                     os.mkdir(ecs_dir+'stability/')
             # compute Floquet multipliers
